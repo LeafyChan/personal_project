@@ -62,27 +62,36 @@ function ActorBadge({ actorType }) {
 }
 
 function EntryRow({ entry }) {
+  // NOTE: this used to reference a local `s` alias for `styles`, but `s` is
+  // only ever defined inside the ActivityLog component below — EntryRow is
+  // a separate top-level function and never had its own `s` binding. Every
+  // render of a real entry threw "ReferenceError: s is not defined" inside
+  // this component, and with no error boundary anywhere in the app (see
+  // App.jsx), that exception unmounted the entire React tree — not just
+  // this tab's content, but the top nav too, which is why the whole page
+  // went blank instead of just showing a broken activity list. Fixed by
+  // referencing `styles` directly, the actual module-scope object.
   const meta = ENTITY_META[entry.entity_type] || { label: entry.entity_type, icon: "•" };
   const actionLabel = ACTION_LABEL[entry.action] || entry.action;
   return (
-    <div style={s.row}>
-      <div style={s.rowIcon}>{meta.icon}</div>
+    <div style={styles.row}>
+      <div style={styles.rowIcon}>{meta.icon}</div>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={s.rowTop}>
-          <span style={s.rowEntity}>{meta.label}</span>
-          <span style={s.rowAction}>{actionLabel}</span>
+        <div style={styles.rowTop}>
+          <span style={styles.rowEntity}>{meta.label}</span>
+          <span style={styles.rowAction}>{actionLabel}</span>
           <ActorBadge actorType={entry.actor_type} />
-          <span style={s.rowTime}>{fmtDatetime(entry.created_at)}</span>
+          <span style={styles.rowTime}>{fmtDatetime(entry.created_at)}</span>
         </div>
-        <div style={s.rowSummary}>
+        <div style={styles.rowSummary}>
           {entry.summary || `${entry.field_name || ""} changed`}
         </div>
         {entry.field_name && (entry.old_value != null || entry.new_value != null) && (
-          <div style={s.rowDiff}>
-            <span style={s.rowField}>{entry.field_name}</span>
-            <span style={s.diffOld}>{entry.old_value ?? "—"}</span>
-            <span style={s.diffArrow}>→</span>
-            <span style={s.diffNew}>{entry.new_value ?? "—"}</span>
+          <div style={styles.rowDiff}>
+            <span style={styles.rowField}>{entry.field_name}</span>
+            <span style={styles.diffOld}>{entry.old_value ?? "—"}</span>
+            <span style={styles.diffArrow}>→</span>
+            <span style={styles.diffNew}>{entry.new_value ?? "—"}</span>
           </div>
         )}
       </div>

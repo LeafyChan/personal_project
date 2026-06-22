@@ -16,7 +16,8 @@
  */
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import ReviewModal, { shouldAutoReview } from "./ReviewModal";
+import ReviewModal from "./ReviewModal";
+import { shouldAutoReview } from "./InvoiceReviewUtils";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 const PAGE_SIZE = 50;

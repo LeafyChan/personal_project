@@ -11,8 +11,8 @@
  * When to show this:
  *   - AUTOMATICALLY right after a low-confidence / NEEDS_MANUAL_REVIEW
  *     invoice is opened (InvoiceList.jsx decides this — see
- *     shouldAutoReview() exported below — this component itself doesn't
- *     decide, it just renders once told to).
+ *     shouldAutoReview() in InvoiceReviewUtils.js — this component itself
+ *     doesn't decide, it just renders once told to).
  *   - On demand via a "Review document" button on ANY invoice, regardless
  *     of confidence — sometimes a clean extraction still has a field a
  *     human wants to double-check against the source document.
@@ -53,15 +53,15 @@ const REVIEW_FIELDS = [
 
 /**
  * Decides whether an invoice should trigger the review popup automatically
- * the moment it's opened. Exported so InvoiceList.jsx's row-click handler
- * can call this without duplicating the threshold logic.
+ * the moment it's opened. This now lives in InvoiceReviewUtils.js, not
+ * here — a .jsx file that default-exports a component AND named-exports a
+ * plain function breaks Vite's React Fast Refresh ("shouldAutoReview"
+ * export is incompatible"), since Fast Refresh requires every export from
+ * a .jsx file to itself be a component. Moving it to a plain .js file
+ * (which has no component exports to be inconsistent with) is the correct
+ * fix per the vite-plugin-react docs. Import it from there:
+ *   import { shouldAutoReview } from "./InvoiceReviewUtils";
  */
-export function shouldAutoReview(invoice) {
-  if (!invoice) return false;
-  if (invoice.status === "NEEDS_MANUAL_REVIEW" || invoice.status === "FAILED") return true;
-  if (typeof invoice.confidence === "number" && invoice.confidence < 70) return true;
-  return false;
-}
 
 /** Which fields actually look blank/missing right now — drives the "fields
  * to fill in" list at the bottom rather than showing all 16 every time. */
@@ -75,6 +75,8 @@ function blankFields(data) {
 export default function ReviewModal({ invoiceId, data, getToken, onClose, onSaved }) {
   const [draft, setDraft]   = useState({});
   const [fileUrl, setFileUrl] = useState(null);
+  const [driveFileId, setDriveFileId] = useState(null);
+  const [storageError, setStorageError] = useState(null);
   const [fileUrlErr, setFileUrlErr] = useState(false);
   const [saving, setSaving] = useState(false);
   const [err, setErr]       = useState(null);
@@ -85,13 +87,31 @@ export default function ReviewModal({ invoiceId, data, getToken, onClose, onSave
     setSaved(false);
     setErr(null);
     setFileUrl(null);
+    setDriveFileId(null);
+    setStorageError(null);
     setFileUrlErr(false);
     if (!invoiceId) return;
     getToken().then(tok =>
       fetch(`${API_BASE}/invoices/${invoiceId}/file-url`, { headers: { Authorization: `Bearer ${tok}` } })
     ).then(r => r.json()).then(d => {
-      if (d.url) setFileUrl(d.url);
-      else setFileUrlErr(true);
+      // Backend's three-tier fallback (see main.py get_file_url):
+      //   1. {url: "<signed supabase url>"} — Storage is up, use it directly
+      //   2. {url: null, drive_file_id: "..."} — Storage unavailable/paused,
+      //      but this invoice came from a Drive sync, so we can embed
+      //      Google Drive's own file preview instead of giving up.
+      //   3. {url: null} — neither is available, show the fallback message.
+      // Previously this only checked d.url and ignored drive_file_id
+      // entirely, so case 2 silently fell through to "preview isn't
+      // available" even when a perfectly good Drive fallback existed.
+      if (d.url) {
+        setFileUrl(d.url);
+      } else if (d.drive_file_id) {
+        setDriveFileId(d.drive_file_id);
+        if (d.storage_error) setStorageError(d.storage_error);
+      } else {
+        if (d.storage_error) setStorageError(d.storage_error);
+        setFileUrlErr(true);
+      }
     }).catch(() => setFileUrlErr(true));
   }, [invoiceId, getToken]);
 
@@ -158,10 +178,24 @@ export default function ReviewModal({ invoiceId, data, getToken, onClose, onSave
           <div style={s.viewerPane}>
             {fileUrl ? (
               <iframe src={fileUrl} title="Invoice document" style={s.iframe} />
+            ) : driveFileId ? (
+              // Supabase Storage signed URL wasn't available (commonly: a
+              // paused free-tier Supabase project), but this invoice came
+              // from a Drive sync, so embed Drive's own file preview
+              // instead of giving up entirely.
+              <iframe
+                src={`https://drive.google.com/file/d/${driveFileId}/preview`}
+                title="Invoice document (from Google Drive)"
+                style={s.iframe}
+                allow="autoplay"
+              />
             ) : fileUrlErr ? (
               <div style={s.viewerFallback}>
                 Document preview isn't available (file storage not configured, or the file is missing).
                 You can still fill in fields from a copy of the invoice you have on hand.
+                {storageError && (
+                  <div style={s.viewerErrorDetail}>Storage error: {storageError}</div>
+                )}
               </div>
             ) : (
               <div style={s.viewerFallback}>Loading document…</div>
@@ -237,6 +271,10 @@ const styles = {
   },
   iframe: { width: "100%", height: "100%", border: "none", background: "#fff" },
   viewerFallback: { color: "#D1D5DB", fontSize: 13, textAlign: "center", padding: 32, lineHeight: 1.6 },
+  viewerErrorDetail: {
+    marginTop: 12, fontSize: 11, color: "#9CA3AF", fontFamily: "monospace",
+    wordBreak: "break-word",
+  },
   formPane: {
     flex: 1, display: "flex", flexDirection: "column", borderLeft: "1px solid #E5E7EB", minWidth: 320,
   },
