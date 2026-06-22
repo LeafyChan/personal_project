@@ -63,6 +63,12 @@ CREATE TABLE IF NOT EXISTS orgs (
     org_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     clerk_org_id    TEXT UNIQUE NOT NULL,  -- Clerk's own org identifier - source of truth for membership
     name            TEXT NOT NULL,
+    drive_folder_id TEXT UNIQUE,           -- nullable; UNIQUE prevents two orgs claiming the same Drive folder
+    -- One-sentence description of what the business does (e.g. "furniture
+    -- manufacturing and retail shop"). Free text the org owner writes once
+    -- in Settings - this is the input to HSN profile generation below, not
+    -- itself a compliance artifact.
+    business_description TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -104,6 +110,39 @@ CREATE POLICY vendors_isolation ON vendors
     USING (org_id = NULLIF(current_setting('app.current_org_id', true), '')::uuid);
 
 -- ============================================================
+-- HSN/SAC PROFILE (one row per code the org's business is expected to use)
+-- ============================================================
+-- Generated from business_description via an LLM call (core/hsn_generator.py),
+-- but stored as individual rows - not a JSON blob - specifically so:
+--   (a) manually added/removed codes survive a later regeneration untouched
+--       (regeneration is preview-then-apply, never a silent overwrite - see
+--       the /org/hsn-profile/generate vs /apply split in main.py)
+--   (b) this table is what GET /itc-summary joins line_items against, so a
+--       line item's hsn_code can be checked against "is this expected for
+--       this business" without re-parsing a JSON column on every request.
+CREATE TABLE IF NOT EXISTS hsn_profile_codes (
+    hsn_profile_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id          UUID NOT NULL REFERENCES orgs(org_id),
+    code            TEXT NOT NULL,
+    code_type       TEXT NOT NULL DEFAULT 'HSN',   -- 'HSN' (goods) | 'SAC' (services)
+    description     TEXT,                           -- what the code covers, shown as a tooltip/label
+    -- 'expected'   - LLM is confident this is a normal code for this business
+    -- 'ambiguous'  - LLM flagged this as needing human confirmation on first
+    --                use (e.g. could be raw material or a fixed asset)
+    -- 'manual'     - added directly by the user, never touched by regeneration
+    confidence      TEXT NOT NULL DEFAULT 'expected',
+    source          TEXT NOT NULL DEFAULT 'generated',  -- 'generated' | 'manual'
+    added_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (org_id, code)
+);
+ALTER TABLE hsn_profile_codes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hsn_profile_codes FORCE ROW LEVEL SECURITY;
+CREATE POLICY hsn_profile_codes_isolation ON hsn_profile_codes
+    USING (org_id = NULLIF(current_setting('app.current_org_id', true), '')::uuid);
+
+CREATE INDEX IF NOT EXISTS idx_hsn_profile_org ON hsn_profile_codes(org_id);
+
+-- ============================================================
 -- INVOICES
 -- ============================================================
 CREATE TABLE IF NOT EXISTS invoices (
@@ -139,6 +178,7 @@ CREATE TABLE IF NOT EXISTS invoices (
     total_amount      NUMERIC(14, 2),
     currency_code     TEXT,
     tax_label_raw     TEXT,
+    tax_rate_percent  NUMERIC(5, 2),  -- e.g. 12.00 for "VAT @ 12%"; null when no rate was printed
     po_number         TEXT,
     hsn_codes         JSONB,
     line_items_raw    JSONB,
@@ -175,6 +215,23 @@ CREATE TABLE IF NOT EXISTS line_items (
     quantity      NUMERIC(12, 3),
     rate          NUMERIC(14, 2),
     amount        NUMERIC(14, 2),
+    -- This line's own tax rate, ONLY when the invoice actually prints a
+    -- per-line rate that's genuinely different from the bill-level rate
+    -- (e.g. a mixed-rate invoice with some 12% items and some 18% items).
+    -- NULL means "no distinct per-line rate was printed" - the bill-level
+    -- invoices.tax_rate_percent applies uniformly, which is mathematically
+    -- identical to applying it per line when every line shares one rate.
+    -- This column exists specifically for the case where that assumption
+    -- is wrong (mixed-rate invoices) - see hsn_generator.py module note
+    -- and validator.py's mixed-rate detection.
+    line_tax_rate_percent NUMERIC(5, 2),
+    -- Business-use share of this line, 0-100, default 100 (fully business
+    -- use). The "200 screws, 100 personal" case: GST invoice ITC is
+    -- claimable on the full GST-paid amount per law, but only the
+    -- business-use portion should actually be CLAIMED - this is the field
+    -- the user edits to make that split explicit and auditable, rather
+    -- than silently claiming either the full amount or zero.
+    business_use_percent NUMERIC(5, 2) NOT NULL DEFAULT 100,
     -- Phase 6 hook: ITC claimability depends on the HSN code's GST rate
     -- and category - this column exists now so that logic is a column-fill
     -- once the HSN rate-lookup table exists, not a schema change.

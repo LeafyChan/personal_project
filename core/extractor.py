@@ -190,6 +190,18 @@ TAX NORMALIZATION (important - invoices use inconsistent terminology):
   "; ". If there is no tax line at all, set tax_label_raw to null.
 - total_gst_amount should always be the sum of all tax shown on the
   invoice, however it's labeled, even when cgst/sgst/igst are null.
+- If a tax percentage is printed anywhere near the tax line (e.g.
+  "VAT @ 12%", "GST 18%", "IGST(18%)", "Tax Rate: 5%"), extract that
+  number into tax_rate_percent as a plain number (12, 18, 5 - no "%"
+  sign). This applies regardless of which tax label is used (GST, VAT,
+  IGST, Sales Tax, etc.) - it is not GST-specific. If multiple tax lines
+  show different rates (e.g. CGST 9% + SGST 9%), use the combined/
+  effective rate if one is printed, otherwise the single rate that
+  applies to the combined tax line. If no percentage is printed anywhere
+  on the invoice, set tax_rate_percent to null - do not calculate or
+  infer it from total_gst_amount / taxable_amount, since rounding in the
+  source numbers makes a back-calculated rate unreliable as a compliance
+  figure.
 
 CURRENCY:
 - Detect the currency symbol or code printed on the invoice (e.g. INR, Rs,
@@ -205,7 +217,16 @@ GENERAL RULES:
   is expected, not an error.
 - All amounts as plain numbers (no currency symbols, no commas).
 - invoice_date in DD-MM-YYYY.
-- line_items as a list of objects: {{description, hsn_code, quantity, rate, amount}}.
+- line_items as a list of objects: {{description, hsn_code, quantity, rate, amount, tax_rate, tax_amount, gross_amount}}.
+  - rate: unit price (price per unit, before tax)
+  - amount: net line total (quantity × rate, before any tax). This is what the extractor already captures.
+  - tax_rate: the tax percentage applied to this line (e.g. 10.0 for VAT @ 10%, 18.0 for GST @ 18%).
+    Use null if no per-line rate is printed — do NOT back-calculate from amounts.
+    This field captures whatever the invoice calls it (VAT, GST, IGST, Sales Tax etc.), not just GST.
+  - tax_amount: the actual tax rupee/currency amount on this line (e.g. if net is 1000 and VAT 10% = 100).
+    If tax is only on the overall bill and not broken out per line, set this to null.
+  - gross_amount: amount + tax_amount (the total for this line including tax). If tax_amount is null,
+    gross_amount should also be null — do not guess.
 - If the document is illegible, low quality, or you are not confident in a
   field, set that field to null rather than guessing. Do not fabricate values.
 - Missing information is common and expected (e.g. a retail receipt with no
@@ -241,7 +262,10 @@ def _build_json_schema(schema: dict) -> dict:
                 "hsn_code": {"type": ["string", "null"]},
                 "quantity": {"type": ["number", "null"]},
                 "rate": {"type": ["number", "null"]},
-                "amount": {"type": ["number", "null"]},
+                "amount": {"type": ["number", "null"]},       # net (pre-tax)
+                "tax_rate": {"type": ["number", "null"]},     # % e.g. 10.0
+                "tax_amount": {"type": ["number", "null"]},   # tax rupee amount
+                "gross_amount": {"type": ["number", "null"]}, # amount + tax_amount
             }
             properties[field] = {
                 "type": ["array", "null"],
@@ -390,6 +414,23 @@ _DEMO_TAX_LABEL_PATTERNS = [
     ("Tax", r"\bTax\b[^:\n]*:\s*([0-9.,]+)"),
 ]
 
+# Tax-rate-percent variants, tried in priority order against the same
+# label vocabulary as _DEMO_TAX_LABEL_PATTERNS above. Covers "VAT @ 12%",
+# "GST 18%", "IGST(18%)", "Tax Rate: 5%" - the common phrasings where a
+# percentage sits right next to the tax label. This is demo-only; in
+# production the model reads the percentage directly off the rendered
+# invoice the same way a human would, which a fixed regex set can't fully
+# replicate (rates can appear anywhere near the line, not just adjacent).
+_DEMO_TAX_RATE_PATTERNS = [
+    r"Total GST[^%\n]*?\(?\s*(\d{1,2}(?:\.\d+)?)\s*%",
+    r"\bGST(?!IN)\b[^%\n]*?\(?\s*(\d{1,2}(?:\.\d+)?)\s*%",
+    r"\bVAT\b[^%\n]*?\(?\s*(\d{1,2}(?:\.\d+)?)\s*%",
+    r"\bIGST\b[^%\n]*?\(?\s*(\d{1,2}(?:\.\d+)?)\s*%",
+    r"Sales Tax[^%\n]*?\(?\s*(\d{1,2}(?:\.\d+)?)\s*%",
+    r"Tax Rate[:\s]*(\d{1,2}(?:\.\d+)?)\s*%",
+    r"\bTax\b[^%\n]*?\(?\s*(\d{1,2}(?:\.\d+)?)\s*%",
+]
+
 _DEMO_CURRENCY_PATTERNS = [
     ("INR", r"(?:₹|Rs\.?\s|INR)"),
     ("USD", r"(?:\$|USD)"),
@@ -436,6 +477,16 @@ def _demo_text_parser(document_text: str, schema: dict) -> dict:
     for code, pattern in _DEMO_CURRENCY_PATTERNS:
         if re.search(pattern, document_text):
             result["currency_code"] = code
+            break
+
+    # Tax rate: tried independently of which label matched above, since the
+    # percentage often sits on the same line as the label regardless of
+    # whether it was GST/VAT/Tax/etc. First match wins - same "whatever's
+    # actually printed" philosophy as the label/currency detection above.
+    for pattern in _DEMO_TAX_RATE_PATTERNS:
+        m = re.search(pattern, document_text, re.IGNORECASE)
+        if m:
+            result["tax_rate_percent"] = m.group(1).strip()
             break
 
     result["_extraction_note"] = (

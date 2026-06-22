@@ -63,13 +63,21 @@ def _get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
-def list_folder_files(folder_id: str) -> list[dict]:
-    """Lists all accepted-type files in the given Drive folder (non-recursive
-    - matches the 'one folder, all invoices dumped together' setup). Returns
-    dicts with id, name, mimeType, modifiedTime."""
+def list_folder_files(folder_id: str, modified_after: str = None) -> list[dict]:
+    """Lists accepted-type files in the given Drive folder, newest first.
+
+    modified_after (optional ISO 8601 string e.g. "2025-01-01T00:00:00Z"):
+      When provided, only files modified after that timestamp are returned —
+      Drive applies this filter server-side so we never fetch metadata for
+      files that can't possibly be new. This is the incremental-sync path
+      for large folders. Without it, all files are listed and dedup happens
+      client-side via is_already_processed (correct but O(n) on folder size).
+    """
     service = _get_drive_service()
     mime_filter = " or ".join(f"mimeType='{m}'" for m in ACCEPTED_MIME_TYPES)
     query = f"'{folder_id}' in parents and ({mime_filter}) and trashed=false"
+    if modified_after:
+        query += f" and modifiedTime > '{modified_after}'"
 
     files = []
     page_token = None
@@ -78,6 +86,7 @@ def list_folder_files(folder_id: str) -> list[dict]:
             q=query,
             spaces="drive",
             fields="nextPageToken, files(id, name, mimeType, modifiedTime)",
+            orderBy="modifiedTime desc",
             pageToken=page_token,
         ).execute()
         files.extend(response.get("files", []))
@@ -87,12 +96,14 @@ def list_folder_files(folder_id: str) -> list[dict]:
     return files
 
 
-def list_new_files(folder_id: str, db_path: str = None) -> list[dict]:
-    """Lists files in the folder that aren't already in the database -
-    this is the dedup check the polling loop uses every cycle so the same
-    invoice is never re-downloaded/re-extracted (and never re-spends Gemini/
-    Groq tokens) once it's been processed."""
-    all_files = list_folder_files(folder_id)
+def list_new_files(folder_id: str, db_path: str = None, modified_after: str = None) -> list[dict]:
+    """Lists files in the folder that aren't already in the database.
+    modified_after is passed through to list_folder_files for server-side
+    filtering — when provided, Drive only returns files newer than that
+    timestamp, so the Python-side dedup check below runs on a much smaller
+    set. The dedup check stays as a safety net for edge cases (e.g. a file
+    modified-time bumped by Drive metadata changes without content change)."""
+    all_files = list_folder_files(folder_id, modified_after=modified_after)
     return [f for f in all_files if not database.is_already_processed(f["id"], db_path)]
 
 

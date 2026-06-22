@@ -1,0 +1,7 @@
+gdrive_key.json
+
+venv/
+__pycache__/
+*.pyc
+
+node_modules/

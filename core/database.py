@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS invoices (
     total_amount      REAL,
     currency_code     TEXT,
     tax_label_raw     TEXT,
+    tax_rate_percent  REAL,         -- e.g. 12 for "VAT @ 12%"; null when no rate was printed
     po_number         TEXT,
     hsn_codes         TEXT,         -- JSON array, kept denormalized for convenience
     line_items_raw    TEXT,         -- original JSON blob, kept for audit/debug
@@ -238,8 +239,8 @@ def save_invoice_row(row: dict, db_path: str = None) -> int:
                  buyer_name, buyer_gstin, invoice_number, invoice_date,
                  payment_due_date, place_of_supply, taxable_amount, cgst_amount,
                  sgst_amount, igst_amount, total_gst_amount, total_amount,
-                 currency_code, tax_label_raw, po_number, hsn_codes, line_items_raw
-               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 currency_code, tax_label_raw, tax_rate_percent, po_number, hsn_codes, line_items_raw
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 vendor_id, row.get("drive_file_id"), row.get("file_name"), row.get("page"),
                 row.get("extraction_method"), row.get("confidence"), row.get("status"),
@@ -248,7 +249,7 @@ def save_invoice_row(row: dict, db_path: str = None) -> int:
                 row.get("invoice_date"), row.get("payment_due_date"), row.get("place_of_supply"),
                 row.get("taxable_amount"), row.get("cgst_amount"), row.get("sgst_amount"),
                 row.get("igst_amount"), row.get("total_gst_amount"), row.get("total_amount"),
-                row.get("currency_code"), row.get("tax_label_raw"), row.get("po_number"),
+                row.get("currency_code"), row.get("tax_label_raw"), row.get("tax_rate_percent"), row.get("po_number"),
                 row.get("hsn_codes"), line_items_raw,
             ),
         )

@@ -95,8 +95,8 @@ def _get_or_create_vendor(db: Session, org_id: str, vendor_name, vendor_gstin, i
         db.execute(
             text(
                 "UPDATE vendors SET "
-                "  last_seen_date = GREATEST(COALESCE(last_seen_date, :d::date), COALESCE(:d::date, last_seen_date)), "
-                "  first_seen_date = LEAST(COALESCE(first_seen_date, :d::date), COALESCE(:d::date, first_seen_date)) "
+                "  last_seen_date = GREATEST(COALESCE(last_seen_date, CAST(:d AS date)), COALESCE(CAST(:d AS date), last_seen_date)), "
+                "  first_seen_date = LEAST(COALESCE(first_seen_date, CAST(:d AS date)), COALESCE(CAST(:d AS date), first_seen_date)) "
                 "WHERE vendor_id = :vid"
             ),
             {"d": invoice_date, "vid": vendor_id},
@@ -156,14 +156,14 @@ def save_invoice_row(db: Session, org_id: str, row: dict, source_type: str = "up
             "  vendor_name, vendor_gstin, buyer_name, buyer_gstin, invoice_number,"
             "  invoice_date, payment_due_date, place_of_supply,"
             "  taxable_amount, cgst_amount, sgst_amount, igst_amount, total_gst_amount, total_amount,"
-            "  currency_code, tax_label_raw, po_number, hsn_codes, line_items_raw"
+            "  currency_code, tax_label_raw, tax_rate_percent, po_number, hsn_codes, line_items_raw"
             ") VALUES ("
             "  :org_id, :vendor_id, :source_type, :drive_file_id, :storage_path, :file_name, :page,"
             "  :extraction_method, :confidence, :status, :issues,"
             "  :vendor_name, :vendor_gstin, :buyer_name, :buyer_gstin, :invoice_number,"
             "  :invoice_date, :payment_due_date, :place_of_supply,"
             "  :taxable_amount, :cgst_amount, :sgst_amount, :igst_amount, :total_gst_amount, :total_amount,"
-            "  :currency_code, :tax_label_raw, :po_number, :hsn_codes, :line_items_raw"
+            "  :currency_code, :tax_label_raw, :tax_rate_percent, :po_number, :hsn_codes, :line_items_raw"
             ") RETURNING invoice_id"
         ),
         {
@@ -194,6 +194,7 @@ def save_invoice_row(db: Session, org_id: str, row: dict, source_type: str = "up
             "total_amount": _parse_amount(row.get("total_amount")),
             "currency_code": row.get("currency_code"),
             "tax_label_raw": row.get("tax_label_raw"),
+            "tax_rate_percent": _parse_amount(row.get("tax_rate_percent")),
             "po_number": row.get("po_number"),
             "hsn_codes": hsn_codes_json,
             "line_items_raw": json.dumps(line_items) if line_items else line_items_raw,
@@ -206,8 +207,10 @@ def save_invoice_row(db: Session, org_id: str, row: dict, source_type: str = "up
             continue
         db.execute(
             text(
-                "INSERT INTO line_items (org_id, invoice_id, description, hsn_code, quantity, rate, amount) "
-                "VALUES (:org_id, :invoice_id, :description, :hsn_code, :quantity, :rate, :amount)"
+                "INSERT INTO line_items (org_id, invoice_id, description, hsn_code, "
+                "quantity, rate, amount, tax_rate, tax_amount, gross_amount) "
+                "VALUES (:org_id, :invoice_id, :description, :hsn_code, "
+                ":quantity, :rate, :amount, :tax_rate, :tax_amount, :gross_amount)"
             ),
             {
                 "org_id": org_id,
@@ -217,6 +220,9 @@ def save_invoice_row(db: Session, org_id: str, row: dict, source_type: str = "up
                 "quantity": _parse_amount(item.get("quantity")),
                 "rate": _parse_amount(item.get("rate")),
                 "amount": _parse_amount(item.get("amount")),
+                "tax_rate": _parse_amount(item.get("tax_rate")),
+                "tax_amount": _parse_amount(item.get("tax_amount")),
+                "gross_amount": _parse_amount(item.get("gross_amount")),
             },
         )
 
