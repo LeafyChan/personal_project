@@ -1,7 +1,10 @@
+# Secrets
 gdrive_key.json
 
+# Python
 venv/
-__pycache__/
+**/__pycache__/
 *.pyc
 
-node_modules/
+# JavaScript / Frontend Node Modules
+**/node_modules/
