@@ -8,3 +8,13 @@ venv/
 
 # JavaScript / Frontend Node Modules
 **/node_modules/
+.claude/settings.local.json
+
+# Environment variables (Secrets)
+.env
+.env.local
+.env*.local
+
+# Local invoice files or data downloads
+/invoices/
+/output/
