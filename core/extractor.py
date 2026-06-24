@@ -212,6 +212,31 @@ CURRENCY:
   of currency. Do not convert or guess an exchange rate.
 
 GENERAL RULES:
+- vendor_name and buyer_name are ONLY the company/individual name itself —
+  typically the first line under a "Seller:"/"Bill From:"/"From:" heading
+  (vendor) or a "Client:"/"Bill To:"/"To:" heading (buyer). NEVER include
+  the address, city, state, PIN code, "Tax Id:"/GSTIN line, phone, or email
+  in vendor_name/buyer_name, even though those usually appear directly below
+  the name in the same visual block. If the name spans a genuine multi-word
+  legal name (e.g. "TechVision Distributors Pvt Ltd"), include the whole
+  name but stop there — do not continue onto the next line just because it's
+  part of the same address block. Concretely: given a Seller block reading
+  "TechVision Distributors Pvt Ltd / Plot 14, MIDC Industrial Area, Andheri
+  East / Mumbai, Maharashtra - 400093 / Tax Id: 27AABCT1234F1Z5 / GSTIN:
+  27AABCT1234F1Z5", vendor_name is exactly "TechVision Distributors Pvt
+  Ltd" — nothing from the address, Tax Id, or GSTIN lines.
+- In a two-column layout (e.g. "Seller:" / "Client:" side by side), treat
+  each column as fully separate: never let text from one column's address
+  or trailing lines bleed into the other column's name field, and never
+  concatenate the seller's block and the buyer's block into one string.
+- A line that looks like a tax identifier (a label containing "Tax Id",
+  "GST", "GSTIN", "VAT No", "TIN", or a bare alphanumeric code in that
+  position) is never part of vendor_name/buyer_name, even if no separate
+  vendor_gstin/buyer_gstin field captures it elsewhere on this particular
+  invoice. If a "Tax Id" value doesn't look like a 15-character Indian
+  GSTIN, still extract it as vendor_gstin/buyer_gstin as printed — do not
+  discard it just because the format looks foreign, and do not fold it into
+  the name field instead.
 - vendor_gstin and buyer_gstin must be exactly as printed (15 characters, no
   spaces). If the invoice is foreign and has no GSTIN, leave it null - this
   is expected, not an error.
@@ -328,21 +353,21 @@ def _call_groq_text(prompt: str, document_text: str, schema: dict) -> dict:
     from groq import Groq
 
     client = Groq()  # picks up GROQ_API_KEY from env
-    json_schema = _build_json_schema(schema)
+    # json_object mode guarantees valid JSON without requiring every property
+    # to be in the schema "required" array. strict json_schema mode had two
+    # mutually exclusive demands: all properties must be in "required", but
+    # the model must also be able to return null for fields absent on the
+    # invoice. Groq rejects the schema if optional fields are missing from
+    # "required", and rejects the response if required fields are null.
+    # json_object sidesteps this — the prompt already instructs the model to
+    # use null for missing fields, which is sufficient in practice.
     response = client.chat.completions.create(
         model=GROQ_MODEL_NAME,
         messages=[
             {"role": "system", "content": prompt},
             {"role": "user", "content": f"--- DOCUMENT TEXT ---\n{document_text}"},
         ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "invoice_extraction",
-                "strict": True,  # constrained decoding - guaranteed schema match, never errors
-                "schema": json_schema,
-            },
-        },
+        response_format={"type": "json_object"},
     )
     return _clean_json_response(response.choices[0].message.content)
 

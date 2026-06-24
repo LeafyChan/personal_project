@@ -11,8 +11,8 @@
  * When to show this:
  *   - AUTOMATICALLY right after a low-confidence / NEEDS_MANUAL_REVIEW
  *     invoice is opened (InvoiceList.jsx decides this — see
- *     shouldAutoReview() in InvoiceReviewUtils.js — this component itself
- *     doesn't decide, it just renders once told to).
+ *     shouldAutoReview() exported below — this component itself doesn't
+ *     decide, it just renders once told to).
  *   - On demand via a "Review document" button on ANY invoice, regardless
  *     of confidence — sometimes a clean extraction still has a field a
  *     human wants to double-check against the source document.
@@ -53,13 +53,9 @@ const REVIEW_FIELDS = [
 
 /**
  * Decides whether an invoice should trigger the review popup automatically
- * the moment it's opened. This now lives in InvoiceReviewUtils.js, not
- * here — a .jsx file that default-exports a component AND named-exports a
- * plain function breaks Vite's React Fast Refresh ("shouldAutoReview"
- * export is incompatible"), since Fast Refresh requires every export from
- * a .jsx file to itself be a component. Moving it to a plain .js file
- * (which has no component exports to be inconsistent with) is the correct
- * fix per the vite-plugin-react docs. Import it from there:
+ * the moment it's opened. Lives in InvoiceReviewUtils.js, not here — a
+ * .jsx file that default-exports a component AND named-exports a plain
+ * function breaks Vite's React Fast Refresh. Import it from there:
  *   import { shouldAutoReview } from "./InvoiceReviewUtils";
  */
 
@@ -74,6 +70,7 @@ function blankFields(data) {
 
 export default function ReviewModal({ invoiceId, data, getToken, onClose, onSaved }) {
   const [draft, setDraft]   = useState({});
+  const [lineItemDrafts, setLineItemDrafts] = useState({}); // { [line_item_id]: { field: value } }
   const [fileUrl, setFileUrl] = useState(null);
   const [driveFileId, setDriveFileId] = useState(null);
   const [storageError, setStorageError] = useState(null);
@@ -81,28 +78,27 @@ export default function ReviewModal({ invoiceId, data, getToken, onClose, onSave
   const [saving, setSaving] = useState(false);
   const [err, setErr]       = useState(null);
   const [saved, setSaved]   = useState(false);
+  const [reconciliationIssues, setReconciliationIssues] = useState([]);
 
   useEffect(() => {
     setDraft({});
+    setLineItemDrafts({});
     setSaved(false);
     setErr(null);
     setFileUrl(null);
     setDriveFileId(null);
     setStorageError(null);
     setFileUrlErr(false);
+    setReconciliationIssues([]);
     if (!invoiceId) return;
     getToken().then(tok =>
       fetch(`${API_BASE}/invoices/${invoiceId}/file-url`, { headers: { Authorization: `Bearer ${tok}` } })
     ).then(r => r.json()).then(d => {
-      // Backend's three-tier fallback (see main.py get_file_url):
-      //   1. {url: "<signed supabase url>"} — Storage is up, use it directly
-      //   2. {url: null, drive_file_id: "..."} — Storage unavailable/paused,
-      //      but this invoice came from a Drive sync, so we can embed
-      //      Google Drive's own file preview instead of giving up.
-      //   3. {url: null} — neither is available, show the fallback message.
-      // Previously this only checked d.url and ignored drive_file_id
-      // entirely, so case 2 silently fell through to "preview isn't
-      // available" even when a perfectly good Drive fallback existed.
+      // Backend's fallback chain (see main.py get_file_url): a real signed
+      // Supabase URL when Storage is reachable, otherwise drive_file_id so
+      // we can embed Google Drive's own preview instead of giving up. This
+      // used to only check d.url and silently discard drive_file_id even
+      // when it was present — meaning the fallback never actually worked.
       if (d.url) {
         setFileUrl(d.url);
       } else if (d.drive_file_id) {
@@ -126,6 +122,18 @@ export default function ReviewModal({ invoiceId, data, getToken, onClose, onSave
     return draft[field] !== undefined ? draft[field] : (data[field] ?? "");
   }
 
+  function lineItemValue(lineItemId, field, original) {
+    const d = lineItemDrafts[lineItemId];
+    return d && d[field] !== undefined ? d[field] : (original ?? "");
+  }
+
+  function setLineItemField(lineItemId, field, value) {
+    setLineItemDrafts(prev => ({
+      ...prev,
+      [lineItemId]: { ...prev[lineItemId], [field]: value },
+    }));
+  }
+
   async function handleSaveAll() {
     setSaving(true);
     setErr(null);
@@ -137,16 +145,41 @@ export default function ReviewModal({ invoiceId, data, getToken, onClose, onSave
           fields[field] = draft[field] === "" ? null : draft[field];
         }
       }
-      if (Object.keys(fields).length === 0) {
+
+      // Build line_items patches only for rows that actually have a draft —
+      // same partial-update contract main.py's PATCH handler already
+      // expects (COALESCE on the backend means omitted fields keep their
+      // current value, so we only need to send what actually changed).
+      const lineItemPatches = Object.entries(lineItemDrafts)
+        .filter(([, fieldsDraft]) => Object.keys(fieldsDraft).length > 0)
+        .map(([lineItemId, fieldsDraft]) => {
+          const patch = { line_item_id: lineItemId };
+          for (const [field, value] of Object.entries(fieldsDraft)) {
+            if (value === "") continue; // omit, don't send empty string for a numeric field
+            patch[field] = ["quantity", "rate", "amount", "line_tax_rate_percent", "business_use_percent"].includes(field)
+              ? Number(value)
+              : value;
+          }
+          return patch;
+        });
+
+      if (Object.keys(fields).length === 0 && lineItemPatches.length === 0) {
         setSaved(true);
         return;
       }
       const res = await fetch(`${API_BASE}/invoices/${invoiceId}`, {
         method: "PATCH",
         headers: { Authorization: `Bearer ${tok}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ fields, line_items: [] }),
+        body: JSON.stringify({ fields, line_items: lineItemPatches }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const result = await res.json();
+      // Backend now reconciles line items against header totals on every
+      // save (see main.py _reconcile_invoice_amounts) and reports specific
+      // mismatches here rather than only setting a status flag invisibly —
+      // surface them immediately instead of making the user reopen the
+      // invoice to discover something doesn't add up.
+      setReconciliationIssues(result.reconciliation_issues || []);
       setSaved(true);
       onSaved?.();
     } catch (e) {
@@ -179,10 +212,13 @@ export default function ReviewModal({ invoiceId, data, getToken, onClose, onSave
             {fileUrl ? (
               <iframe src={fileUrl} title="Invoice document" style={s.iframe} />
             ) : driveFileId ? (
-              // Supabase Storage signed URL wasn't available (commonly: a
-              // paused free-tier Supabase project), but this invoice came
-              // from a Drive sync, so embed Drive's own file preview
-              // instead of giving up entirely.
+              // Drive's "/preview" URL embeds inline with no sign-in prompt.
+              // "/view" (used in an earlier version of this fix) is Drive's
+              // full interactive viewer — it's auth-gated and can refuse to
+              // render inside an iframe at all, which is exactly the
+              // "asks to sign in and pops a new browser window" symptom.
+              // "/preview" is the embeddable, no-auth-prompt variant and
+              // never opens a new tab on its own.
               <iframe
                 src={`https://drive.google.com/file/d/${driveFileId}/preview`}
                 title="Invoice document (from Google Drive)"
@@ -205,6 +241,17 @@ export default function ReviewModal({ invoiceId, data, getToken, onClose, onSave
           {/* ── Fill-in-the-blanks form ── */}
           <div style={s.formPane}>
             <div style={s.formScroll}>
+              {reconciliationIssues.length > 0 && (
+                <div style={s.reconcileBanner}>
+                  <div style={s.reconcileTitle}>⚠ Amounts don't add up</div>
+                  {reconciliationIssues.map((issue, i) => (
+                    <div key={i} style={s.reconcileLine}>{issue}</div>
+                  ))}
+                  <div style={s.reconcileHint}>
+                    Saved anyway — this invoice is flagged for review until the numbers reconcile.
+                  </div>
+                </div>
+              )}
               {fieldsToShow.map(([label, field, inputType]) => {
                 const isBlank = data[field] == null || data[field] === "";
                 return (
@@ -220,6 +267,78 @@ export default function ReviewModal({ invoiceId, data, getToken, onClose, onSave
                       placeholder={isBlank ? "Not extracted — type what's on the document" : ""}
                       style={{ ...s.formInput, ...(isBlank ? s.formInputBlank : {}) }}
                     />
+                  </div>
+                );
+              })}
+
+              {/* ── Line items — previously missing entirely from this
+                  modal, including the per-line tax % the person flagged
+                  as not showing up anywhere here. ── */}
+              <div style={s.lineItemsHeading}>
+                Line items {data.line_items?.length > 0 ? `(${data.line_items.length})` : ""}
+              </div>
+              {(!data.line_items || data.line_items.length === 0) && (
+                <div style={s.noLineItems}>No line items recorded for this invoice.</div>
+              )}
+              {data.line_items?.map(item => {
+                const lid = item.line_item_id;
+                return (
+                  <div key={lid} style={s.lineItemCard}>
+                    <input
+                      type="text"
+                      value={lineItemValue(lid, "description", item.description)}
+                      onChange={e => setLineItemField(lid, "description", e.target.value)}
+                      placeholder="Description"
+                      style={{ ...s.formInput, marginBottom: 6 }}
+                    />
+                    <div style={s.lineItemGrid}>
+                      <div>
+                        <label style={s.lineItemLabel}>HSN/SAC</label>
+                        <input
+                          type="text"
+                          value={lineItemValue(lid, "hsn_code", item.hsn_code)}
+                          onChange={e => setLineItemField(lid, "hsn_code", e.target.value)}
+                          style={s.formInputSmall}
+                        />
+                      </div>
+                      <div>
+                        <label style={s.lineItemLabel}>Qty</label>
+                        <input
+                          type="number"
+                          value={lineItemValue(lid, "quantity", item.quantity)}
+                          onChange={e => setLineItemField(lid, "quantity", e.target.value)}
+                          style={s.formInputSmall}
+                        />
+                      </div>
+                      <div>
+                        <label style={s.lineItemLabel}>Rate</label>
+                        <input
+                          type="number"
+                          value={lineItemValue(lid, "rate", item.rate)}
+                          onChange={e => setLineItemField(lid, "rate", e.target.value)}
+                          style={s.formInputSmall}
+                        />
+                      </div>
+                      <div>
+                        <label style={s.lineItemLabel}>Amount</label>
+                        <input
+                          type="number"
+                          value={lineItemValue(lid, "amount", item.amount)}
+                          onChange={e => setLineItemField(lid, "amount", e.target.value)}
+                          style={s.formInputSmall}
+                        />
+                      </div>
+                      <div>
+                        <label style={s.lineItemLabel}>Tax %</label>
+                        <input
+                          type="number"
+                          value={lineItemValue(lid, "line_tax_rate_percent", item.line_tax_rate_percent)}
+                          onChange={e => setLineItemField(lid, "line_tax_rate_percent", e.target.value)}
+                          placeholder="—"
+                          style={s.formInputSmall}
+                        />
+                      </div>
+                    </div>
                   </div>
                 );
               })}
@@ -274,6 +393,34 @@ const styles = {
   viewerErrorDetail: {
     marginTop: 12, fontSize: 11, color: "#9CA3AF", fontFamily: "monospace",
     wordBreak: "break-word",
+  },
+  reconcileBanner: {
+    background: "#FFFBEB", border: "1px solid #FDE68A", borderRadius: 8,
+    padding: "10px 12px", marginBottom: 14,
+  },
+  reconcileTitle: { fontSize: 12, fontWeight: 700, color: "#92400E", marginBottom: 4 },
+  reconcileLine: { fontSize: 12, color: "#92400E", lineHeight: 1.5 },
+  reconcileHint: { fontSize: 11, color: "#B45309", marginTop: 6, lineHeight: 1.4 },
+  lineItemsHeading: {
+    fontSize: 11, fontWeight: 700, color: "#6B7280", textTransform: "uppercase",
+    letterSpacing: "0.04em", marginTop: 18, marginBottom: 8, paddingTop: 14,
+    borderTop: "1px solid #E5E7EB",
+  },
+  noLineItems: { fontSize: 12, color: "#9CA3AF", fontStyle: "italic" },
+  lineItemCard: {
+    border: "1px solid #E5E7EB", borderRadius: 8, padding: 10, marginBottom: 8,
+    background: "#FAFAFB",
+  },
+  lineItemGrid: {
+    display: "grid", gridTemplateColumns: "1fr 0.7fr 0.8fr 0.9fr 0.8fr", gap: 6,
+  },
+  lineItemLabel: {
+    display: "block", fontSize: 10, fontWeight: 600, color: "#9CA3AF",
+    textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 2,
+  },
+  formInputSmall: {
+    width: "100%", border: "1px solid #D1D5DB", borderRadius: 5, padding: "5px 7px",
+    fontSize: 12, fontFamily: "inherit", outline: "none", color: "#111318", boxSizing: "border-box",
   },
   formPane: {
     flex: 1, display: "flex", flexDirection: "column", borderLeft: "1px solid #E5E7EB", minWidth: 320,

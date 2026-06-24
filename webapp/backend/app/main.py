@@ -154,6 +154,86 @@ def log_activity(
     )
 
 
+def _reconcile_invoice_amounts(db: Session, invoice_id: str) -> list[str]:
+    """
+    Re-checks an invoice's amounts AFTER all edits in this request have been
+    applied — line items and header fields, in whatever combination the
+    caller sent — and returns a list of human-readable mismatch descriptions
+    (empty list = reconciles fine).
+
+    Deliberately re-reads everything fresh from the DB rather than working
+    from any pre-edit Python variable still in scope: the whole point is to
+    catch a case like "edit total_amount to 310, no matching line-item
+    change" on one save, and then on a LATER save "edit one line item's
+    amount from 100 to 150" and have the check evaluate against the NEW
+    150, never the original 100 that prompted the first warning. Trusting
+    an in-memory value across the chain of edits described in the project
+    log would silently reintroduce exactly the bug this exists to catch.
+
+    Reuses validator.py's existing amount_reconciliation_tolerance from the
+    same schema.json the OCR pipeline already validates against (loaded via
+    core_pipeline.load_schema(SCHEMA_PATH), same call used elsewhere in this
+    file) rather than hardcoding a second, possibly-drifting tolerance value
+    here. Mirrors validator.py's rule 3 (taxable + gst ≈ total) and adds the
+    line-items-vs-taxable_amount check validator.py doesn't do today, since
+    validator.py only ever sees freshly-extracted data, never a human edit
+    that changed one line independently of the header total.
+    """
+    try:
+        schema = core_pipeline.load_schema(SCHEMA_PATH)
+        tolerance = schema["validation_rules"]["amount_reconciliation_tolerance"]
+    except Exception:
+        # Schema unreadable for some reason — fall back to a conservative
+        # default rather than skipping the check entirely (silence here
+        # would defeat the whole point: better a slightly-off tolerance
+        # than no reconciliation check at all on a save).
+        tolerance = 1.0
+
+    row = db.execute(
+        text("SELECT taxable_amount, total_gst_amount, total_amount "
+             "FROM invoices WHERE invoice_id = :iid"),
+        {"iid": invoice_id}).mappings().fetchone()
+    if not row:
+        return []
+
+    line_sum = db.execute(
+        text("SELECT COALESCE(SUM(amount), 0) FROM line_items WHERE invoice_id = :iid "
+             "AND amount IS NOT NULL"),
+        {"iid": invoice_id}).scalar()
+    has_line_items = db.execute(
+        text("SELECT COUNT(*) FROM line_items WHERE invoice_id = :iid AND amount IS NOT NULL"),
+        {"iid": invoice_id}).scalar()
+
+    taxable = row["taxable_amount"]
+    gst = row["total_gst_amount"]
+    total = row["total_amount"]
+    issues = []
+
+    # Line items (source of truth for what was actually bought) vs the
+    # header's taxable_amount. Only checked when there's at least one line
+    # item with a real amount — an invoice with no line items recorded at
+    # all (e.g. extracted from a degraded scan) has nothing to reconcile
+    # against, and that gap is already what NEEDS_MANUAL_REVIEW exists for.
+    if has_line_items and taxable is not None:
+        if abs(float(line_sum) - float(taxable)) > tolerance:
+            issues.append(
+                f"Line items sum to {line_sum:.2f}, but taxable_amount is {taxable:.2f}"
+            )
+
+    # taxable + gst ≈ total — same check validator.py already does at OCR
+    # time (rule 3), now also enforced after a human edit, which previously
+    # had zero reconciliation of any kind.
+    if taxable is not None and gst is not None and total is not None:
+        expected_total = float(taxable) + float(gst)
+        if abs(expected_total - float(total)) > tolerance:
+            issues.append(
+                f"taxable_amount ({taxable:.2f}) + total_gst_amount ({gst:.2f}) = "
+                f"{expected_total:.2f}, but total_amount is {total:.2f}"
+            )
+
+    return issues
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -795,7 +875,50 @@ def patch_invoice(
                         + (f": {li.description}" if li.description else ""),
             )
 
-    return {"invoice_id": invoice_id, "updated": True}
+    # Re-check amount reconciliation AFTER every edit in this request has
+    # been applied (header fields above, line items below all run first —
+    # this must be the last thing before the function returns). Per
+    # project decision: never reject the save outright — apply it, but
+    # flag the invoice so the mismatch is visible rather than silently
+    # wrong. A user correcting one field at a time (as in the project log's
+    # walkthrough: edit total_amount, see the warning, then edit a line
+    # item) needs every individual save to succeed; only the STATUS should
+    # reflect whether the invoice currently adds up.
+    reconciliation_issues = _reconcile_invoice_amounts(db, invoice_id)
+    if reconciliation_issues:
+        db.execute(
+            text("UPDATE invoices SET status = 'WARNING', "
+                 "issues = :issues WHERE invoice_id = :iid"),
+            {"iid": invoice_id, "issues": "; ".join(reconciliation_issues)})
+        log_activity(
+            db, ctx["org_id"], actor_type="user", actor_id=ctx["user_id"],
+            action="invoice_field_edit", entity_type="invoice", entity_id=invoice_id,
+            field_name="status", old_value=current.get("status"), new_value="WARNING",
+            summary=f"Flagged WARNING after edit on {current.get('file_name') or invoice_id}: "
+                    + "; ".join(reconciliation_issues),
+        )
+    elif current.get("status") == "WARNING" and current.get("issues") and (
+        "taxable_amount is" in current["issues"] or "total_amount is" in current["issues"]
+    ):
+        # Only auto-clear when the EXISTING warning text matches the
+        # specific phrasing this function produces (see the two issue
+        # strings above) — i.e. we can actually confirm the problem we're
+        # about to clear is the one we just re-checked. A WARNING set for
+        # an unrelated reason (e.g. validator.py flagging a GSTIN format
+        # problem at OCR time) must never be silently cleared just because
+        # this one PATCH happened not to touch amounts — this check has no
+        # way to know whether THAT problem is still unresolved, so it has
+        # no business clearing the flag for it.
+        db.execute(
+            text("UPDATE invoices SET status = 'PASSED', issues = NULL "
+                 "WHERE invoice_id = :iid"),
+            {"iid": invoice_id})
+
+    return {
+        "invoice_id": invoice_id,
+        "updated": True,
+        "reconciliation_issues": reconciliation_issues,
+    }
 
 
 # ── Activity log (read) ───────────────────────────────────────────────────────
